@@ -6,12 +6,13 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
-	"os/signal"
 	"syscall"
 
 	"github.com/yourorg/kakuremichi/agent/internal/config"
+	"github.com/yourorg/kakuremichi/agent/internal/exitnode"
 	"github.com/yourorg/kakuremichi/agent/internal/proxy"
 	"github.com/yourorg/kakuremichi/agent/internal/wireguard"
 	"github.com/yourorg/kakuremichi/agent/internal/ws"
@@ -54,6 +55,10 @@ func main() {
 
 	// Local proxy will be initialized after receiving virtual IP from Control
 	var localProxy *proxy.LocalProxy
+
+	// Exit Node proxies (will be initialized after receiving config)
+	var exitHTTPProxy *exitnode.LocalHTTPProxy
+	var exitSOCKS5Proxy *exitnode.LocalSOCKS5Proxy
 
 	// Initialize WebSocket client (Control connection)
 	// Pass public key and private key to the client
@@ -144,6 +149,60 @@ func main() {
 			}
 			localProxy.UpdateTunnels(tunnels)
 		}
+
+		// Initialize Exit Node proxies (only if WireGuard device is available)
+		if wgDevice != nil {
+			// Find first tunnel with proxy enabled and get its gateway IP
+			var httpGatewayAddr, socksGatewayAddr string
+			for _, t := range config.Tunnels {
+				if len(t.GatewayIPs) == 0 {
+					continue
+				}
+				gatewayIP := t.GatewayIPs[0].IP // Use first available gateway
+				if t.HTTPProxyEnabled && httpGatewayAddr == "" {
+					httpGatewayAddr = fmt.Sprintf("%s:%d", gatewayIP, config.ProxyConfig.HTTPProxyPort)
+				}
+				if t.SOCKSProxyEnabled && socksGatewayAddr == "" {
+					socksGatewayAddr = fmt.Sprintf("%s:%d", gatewayIP, config.ProxyConfig.SOCKSProxyPort)
+				}
+			}
+
+			// Start/update HTTP proxy
+			if httpGatewayAddr != "" {
+				listenAddr := fmt.Sprintf("%s:%d", config.ProxyConfig.LocalListenAddr, config.ProxyConfig.HTTPProxyPort)
+				if exitHTTPProxy == nil {
+					exitHTTPProxy = exitnode.NewLocalHTTPProxy(listenAddr, wgDevice.Net(), httpGatewayAddr)
+					go func() {
+						if err := exitHTTPProxy.Start(ctx); err != nil {
+							slog.Error("Exit HTTP proxy stopped", "error", err)
+						}
+					}()
+				} else {
+					exitHTTPProxy.UpdateGateway(httpGatewayAddr)
+				}
+			} else if exitHTTPProxy != nil {
+				exitHTTPProxy.Stop()
+				exitHTTPProxy = nil
+			}
+
+			// Start/update SOCKS5 proxy
+			if socksGatewayAddr != "" {
+				listenAddr := fmt.Sprintf("%s:%d", config.ProxyConfig.LocalListenAddr, config.ProxyConfig.SOCKSProxyPort)
+				if exitSOCKS5Proxy == nil {
+					exitSOCKS5Proxy = exitnode.NewLocalSOCKS5Proxy(listenAddr, wgDevice.Net(), socksGatewayAddr)
+					go func() {
+						if err := exitSOCKS5Proxy.Start(ctx); err != nil {
+							slog.Error("Exit SOCKS5 proxy stopped", "error", err)
+						}
+					}()
+				} else {
+					exitSOCKS5Proxy.UpdateGateway(socksGatewayAddr)
+				}
+			} else if exitSOCKS5Proxy != nil {
+				exitSOCKS5Proxy.Stop()
+				exitSOCKS5Proxy = nil
+			}
+		}
 	})
 
 	// Connect to Control server
@@ -186,6 +245,12 @@ func main() {
 	cancel()
 
 	// Graceful shutdown
+	if exitHTTPProxy != nil {
+		exitHTTPProxy.Stop()
+	}
+	if exitSOCKS5Proxy != nil {
+		exitSOCKS5Proxy.Stop()
+	}
 	if wgDevice != nil {
 		wgDevice.Close()
 	}
@@ -193,7 +258,7 @@ func main() {
 		localProxy.Shutdown()
 	}
 
-fmt.Println("Agent stopped")
+	fmt.Println("Agent stopped")
 }
 
 // loadOrCreateKeys returns (private, public) WireGuard keys.

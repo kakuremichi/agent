@@ -110,12 +110,20 @@ type AgentConfig struct {
 		AllowedIPs         []string `json:"allowedIPs"` // Gateway IPs for WireGuard peer (e.g., ["10.1.0.254/32", "10.2.0.254/32"])
 	} `json:"gateways"`
 	Tunnels []struct {
-		ID         string            `json:"id"`
-		Domain     string            `json:"domain"`
-		Target     string            `json:"target"`
-		Enabled    bool              `json:"enabled"`
-		Subnet     string            `json:"subnet"`     // e.g., "10.1.0.0/24"
-		AgentIP    string            `json:"agentIp"`    // e.g., "10.1.0.2"
-		GatewayIPs []TunnelGatewayIP `json:"gatewayIps"` // All gateway IPs for this tunnel
+		ID                string            `json:"id"`
+		Domain            string            `json:"domain"`
+		Target            string            `json:"target"`
+		Enabled           bool              `json:"enabled"`
+		Subnet            string            `json:"subnet"`     // e.g., "10.1.0.0/24"
+		AgentIP           string            `json:"agentIp"`    // e.g., "10.1.0.2"
+		GatewayIPs        []TunnelGatewayIP `json:"gatewayIps"` // All gateway IPs for this tunnel
+		HTTPProxyEnabled  bool              `json:"httpProxyEnabled"`
+		SOCKSProxyEnabled bool              `json:"socksProxyEnabled"`
 	} `json:"tunnels"`
+	// Exit Node proxy configuration
+	ProxyConfig struct {
+		HTTPProxyPort   int    `json:"httpProxyPort"`
+		SOCKSProxyPort  int    `json:"socksProxyPort"`
+		LocalListenAddr string `json:"localListenAddr"` // "localhost" or "0.0.0.0"
+	} `json:"proxyConfig"`
 }
