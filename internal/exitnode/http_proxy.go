@@ -16,22 +16,42 @@ import (
 // LocalHTTPProxy is a local HTTP CONNECT proxy that forwards to Gateway via netstack.
 // It listens on localhost and routes traffic through WireGuard tunnel.
 type LocalHTTPProxy struct {
-	listenAddr  string        // e.g., "localhost:8080"
-	tnet        *netstack.Net // WireGuard netstack for outbound connections
-	gatewayAddr string        // Gateway proxy address e.g., "10.1.0.254:8080"
-	listener    net.Listener
-	mu          sync.Mutex
-	running     bool
-	cancel      context.CancelFunc
+	listenAddr   string        // e.g., "localhost:8080"
+	tnet         *netstack.Net // WireGuard netstack for outbound connections
+	gatewayAddrs []string      // Gateway proxy addresses, tried in order for failover
+	listener     net.Listener
+	mu           sync.RWMutex
+	running      bool
+	cancel       context.CancelFunc
 }
 
 // NewLocalHTTPProxy creates a new local HTTP proxy
-func NewLocalHTTPProxy(listenAddr string, tnet *netstack.Net, gatewayAddr string) *LocalHTTPProxy {
+func NewLocalHTTPProxy(listenAddr string, tnet *netstack.Net, gatewayAddrs []string) *LocalHTTPProxy {
 	return &LocalHTTPProxy{
-		listenAddr:  listenAddr,
-		tnet:        tnet,
-		gatewayAddr: gatewayAddr,
+		listenAddr:   listenAddr,
+		tnet:         tnet,
+		gatewayAddrs: append([]string(nil), gatewayAddrs...),
 	}
+}
+
+// dialGateway tries each configured gateway address until one connects.
+func (p *LocalHTTPProxy) dialGateway() (net.Conn, string, error) {
+	p.mu.RLock()
+	addrs := append([]string(nil), p.gatewayAddrs...)
+	p.mu.RUnlock()
+	if len(addrs) == 0 {
+		return nil, "", fmt.Errorf("no gateway configured")
+	}
+	var lastErr error
+	for _, addr := range addrs {
+		conn, err := p.tnet.Dial("tcp", addr)
+		if err == nil {
+			return conn, addr, nil
+		}
+		lastErr = err
+		slog.Debug("Gateway dial failed, trying next", "gateway", addr, "error", err)
+	}
+	return nil, "", fmt.Errorf("all gateways failed: %w", lastErr)
 }
 
 // Start starts the local HTTP proxy
@@ -55,7 +75,7 @@ func (p *LocalHTTPProxy) Start(ctx context.Context) error {
 	p.cancel = cancel
 	p.mu.Unlock()
 
-	slog.Info("Local HTTP proxy listening", "addr", p.listenAddr, "gateway", p.gatewayAddr)
+	slog.Info("Local HTTP proxy listening", "addr", p.listenAddr, "gateways", p.gatewayAddrs)
 
 	go func() {
 		<-childCtx.Done()
@@ -98,16 +118,14 @@ func (p *LocalHTTPProxy) handleConnection(clientConn net.Conn) {
 
 // handleConnect handles HTTPS tunneling via CONNECT method
 func (p *LocalHTTPProxy) handleConnect(clientConn net.Conn, req *http.Request) {
-	slog.Debug("Local HTTP CONNECT request", "host", req.Host, "via_gateway", p.gatewayAddr)
-
-	// Connect to Gateway's proxy via netstack
-	gatewayConn, err := p.tnet.Dial("tcp", p.gatewayAddr)
+	gatewayConn, gatewayAddr, err := p.dialGateway()
 	if err != nil {
-		slog.Debug("Failed to connect to gateway proxy", "gateway", p.gatewayAddr, "error", err)
+		slog.Debug("Failed to connect to any gateway proxy", "error", err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer gatewayConn.Close()
+	slog.Debug("Local HTTP CONNECT request", "host", req.Host, "via_gateway", gatewayAddr)
 
 	// Forward CONNECT request to Gateway
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", req.Host, req.Host)
@@ -154,16 +172,14 @@ func (p *LocalHTTPProxy) handleConnect(clientConn net.Conn, req *http.Request) {
 
 // handleHTTP handles plain HTTP requests (non-CONNECT)
 func (p *LocalHTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request, reader *bufio.Reader) {
-	slog.Debug("Local HTTP request", "method", req.Method, "url", req.URL.String(), "via_gateway", p.gatewayAddr)
-
-	// Connect to Gateway's proxy via netstack
-	gatewayConn, err := p.tnet.Dial("tcp", p.gatewayAddr)
+	gatewayConn, gatewayAddr, err := p.dialGateway()
 	if err != nil {
-		slog.Debug("Failed to connect to gateway proxy", "gateway", p.gatewayAddr, "error", err)
+		slog.Debug("Failed to connect to any gateway proxy", "error", err)
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer gatewayConn.Close()
+	slog.Debug("Local HTTP request", "method", req.Method, "url", req.URL.String(), "via_gateway", gatewayAddr)
 
 	// Forward the request to Gateway
 	if err := req.Write(gatewayConn); err != nil {
@@ -176,11 +192,11 @@ func (p *LocalHTTPProxy) handleHTTP(clientConn net.Conn, req *http.Request, read
 	io.Copy(clientConn, gatewayConn)
 }
 
-// UpdateGateway updates the gateway proxy address
-func (p *LocalHTTPProxy) UpdateGateway(gatewayAddr string) {
+// UpdateGateways replaces the full list of gateway proxy addresses.
+func (p *LocalHTTPProxy) UpdateGateways(gatewayAddrs []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.gatewayAddr = gatewayAddr
+	p.gatewayAddrs = append([]string(nil), gatewayAddrs...)
 }
 
 // Stop stops the local HTTP proxy

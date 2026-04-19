@@ -39,7 +39,9 @@ func (p *LocalProxy) UpdateTunnels(tunnels []TunnelMapping) {
 		}
 	}
 
+	p.mu.Lock()
 	p.tunnels = newTunnels
+	p.mu.Unlock()
 }
 
 // Start starts the local proxy server
@@ -101,7 +103,9 @@ func (p *LocalProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("Received request", "host", host, "path", r.URL.Path, "method", r.Method)
 
 	// Find tunnel for this domain
+	p.mu.RLock()
 	tunnel, exists := p.tunnels[host]
+	p.mu.RUnlock()
 	if !exists {
 		slog.Warn("No tunnel found for domain", "domain", host)
 		http.Error(w, "No tunnel configured for this domain", http.StatusNotFound)
@@ -158,7 +162,9 @@ func (p *LocalProxy) Shutdown() error {
 
 // GetTunnels returns current tunnel mappings (for testing/debugging)
 func (p *LocalProxy) GetTunnels() map[string]*TunnelMapping {
-	result := make(map[string]*TunnelMapping)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make(map[string]*TunnelMapping, len(p.tunnels))
 	for k, v := range p.tunnels {
 		result[k] = v
 	}

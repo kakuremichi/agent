@@ -32,22 +32,42 @@ const (
 
 // LocalSOCKS5Proxy is a local SOCKS5 proxy that forwards to Gateway via netstack.
 type LocalSOCKS5Proxy struct {
-	listenAddr  string        // e.g., "localhost:1080"
-	tnet        *netstack.Net // WireGuard netstack for outbound connections
-	gatewayAddr string        // Gateway SOCKS5 address e.g., "10.1.0.254:1080"
-	listener    net.Listener
-	mu          sync.Mutex
-	running     bool
-	cancel      context.CancelFunc
+	listenAddr   string        // e.g., "localhost:1080"
+	tnet         *netstack.Net // WireGuard netstack for outbound connections
+	gatewayAddrs []string      // Gateway SOCKS5 addresses, tried in order for failover
+	listener     net.Listener
+	mu           sync.RWMutex
+	running      bool
+	cancel       context.CancelFunc
 }
 
 // NewLocalSOCKS5Proxy creates a new local SOCKS5 proxy
-func NewLocalSOCKS5Proxy(listenAddr string, tnet *netstack.Net, gatewayAddr string) *LocalSOCKS5Proxy {
+func NewLocalSOCKS5Proxy(listenAddr string, tnet *netstack.Net, gatewayAddrs []string) *LocalSOCKS5Proxy {
 	return &LocalSOCKS5Proxy{
-		listenAddr:  listenAddr,
-		tnet:        tnet,
-		gatewayAddr: gatewayAddr,
+		listenAddr:   listenAddr,
+		tnet:         tnet,
+		gatewayAddrs: append([]string(nil), gatewayAddrs...),
 	}
+}
+
+// dialGateway tries each configured gateway address until one connects.
+func (p *LocalSOCKS5Proxy) dialGateway() (net.Conn, string, error) {
+	p.mu.RLock()
+	addrs := append([]string(nil), p.gatewayAddrs...)
+	p.mu.RUnlock()
+	if len(addrs) == 0 {
+		return nil, "", fmt.Errorf("no gateway configured")
+	}
+	var lastErr error
+	for _, addr := range addrs {
+		conn, err := p.tnet.Dial("tcp", addr)
+		if err == nil {
+			return conn, addr, nil
+		}
+		lastErr = err
+		slog.Debug("Gateway SOCKS5 dial failed, trying next", "gateway", addr, "error", err)
+	}
+	return nil, "", fmt.Errorf("all gateways failed: %w", lastErr)
 }
 
 // Start starts the local SOCKS5 proxy
@@ -71,7 +91,7 @@ func (p *LocalSOCKS5Proxy) Start(ctx context.Context) error {
 	p.cancel = cancel
 	p.mu.Unlock()
 
-	slog.Info("Local SOCKS5 proxy listening", "addr", p.listenAddr, "gateway", p.gatewayAddr)
+	slog.Info("Local SOCKS5 proxy listening", "addr", p.listenAddr, "gateways", p.gatewayAddrs)
 
 	go func() {
 		<-childCtx.Done()
@@ -111,16 +131,14 @@ func (p *LocalSOCKS5Proxy) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	slog.Debug("Local SOCKS5 request", "target", targetAddr, "via_gateway", p.gatewayAddr)
-
-	// Connect to Gateway's SOCKS5 via netstack
-	gatewayConn, err := p.tnet.Dial("tcp", p.gatewayAddr)
+	gatewayConn, gatewayAddr, err := p.dialGateway()
 	if err != nil {
-		slog.Debug("Failed to connect to gateway SOCKS5", "gateway", p.gatewayAddr, "error", err)
+		slog.Debug("Failed to connect to any gateway SOCKS5", "error", err)
 		p.sendReply(clientConn, repGeneralFailure)
 		return
 	}
 	defer gatewayConn.Close()
+	slog.Debug("Local SOCKS5 request", "target", targetAddr, "via_gateway", gatewayAddr)
 
 	// Perform SOCKS5 handshake with Gateway
 	if err := p.gatewayHandshake(gatewayConn); err != nil {
@@ -346,11 +364,11 @@ func (p *LocalSOCKS5Proxy) sendReply(conn net.Conn, rep byte) {
 	conn.Write(reply)
 }
 
-// UpdateGateway updates the gateway proxy address
-func (p *LocalSOCKS5Proxy) UpdateGateway(gatewayAddr string) {
+// UpdateGateways replaces the full list of gateway SOCKS5 addresses.
+func (p *LocalSOCKS5Proxy) UpdateGateways(gatewayAddrs []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.gatewayAddr = gatewayAddr
+	p.gatewayAddrs = append([]string(nil), gatewayAddrs...)
 }
 
 // Stop stops the local SOCKS5 proxy
