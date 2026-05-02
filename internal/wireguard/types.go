@@ -1,6 +1,8 @@
 package wireguard
 
 import (
+	"sync"
+
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/netstack"
@@ -22,6 +24,8 @@ type DeviceConfig struct {
 
 // Device represents a WireGuard device manager for Agent
 type Device struct {
+	mu         sync.Mutex
+	closed     bool
 	config     *DeviceConfig
 	privateKey string
 	publicKey  string

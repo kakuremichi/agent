@@ -151,13 +151,27 @@ func (d *Device) UpdateGateways(gateways []GatewayPeer) error {
 
 // Close closes the WireGuard device
 func (d *Device) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return nil
+	}
+	d.closed = true
+
 	slog.Info("Closing WireGuard device")
 
-	if d.device != nil {
-		d.device.Close()
-	}
-	if d.tun != nil {
-		d.tun.Close()
+	wgDevice := d.device
+	tunDevice := d.tun
+	d.device = nil
+	d.tun = nil
+	d.net = nil
+
+	// wireguard/device.Close closes the TUN device it owns. Only close the
+	// TUN directly if a WireGuard device was never created.
+	if wgDevice != nil {
+		wgDevice.Close()
+	} else if tunDevice != nil {
+		tunDevice.Close()
 	}
 
 	return nil
