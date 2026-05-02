@@ -9,7 +9,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/yourorg/kakuremichi/agent/internal/config"
 	"github.com/yourorg/kakuremichi/agent/internal/exitnode"
@@ -59,6 +61,26 @@ func main() {
 	// Exit Node proxies (will be initialized after receiving config)
 	var exitHTTPProxy *exitnode.LocalHTTPProxy
 	var exitSOCKS5Proxy *exitnode.LocalSOCKS5Proxy
+	var gatewayProbeOnce sync.Once
+	gatewayProbeTrigger := make(chan struct{}, 1)
+	var gatewayProbeMu sync.RWMutex
+	var gatewayProbeIPs []string
+	setGatewayProbeIPs := func(ips []string) {
+		gatewayProbeMu.Lock()
+		gatewayProbeIPs = append(gatewayProbeIPs[:0], ips...)
+		gatewayProbeMu.Unlock()
+	}
+	getGatewayProbeIPs := func() []string {
+		gatewayProbeMu.RLock()
+		defer gatewayProbeMu.RUnlock()
+		return append([]string(nil), gatewayProbeIPs...)
+	}
+	triggerGatewayProbe := func() {
+		select {
+		case gatewayProbeTrigger <- struct{}{}:
+		default:
+		}
+	}
 
 	// Initialize WebSocket client (Control connection)
 	// Pass public key and private key to the client
@@ -81,6 +103,25 @@ func main() {
 			slog.Warn("No tunnels with AgentIP configured, skipping WireGuard setup")
 			return
 		}
+
+		// Collect Gateway tunnel IPs that the Agent can probe through WireGuard.
+		// A short Agent->Gateway connection refreshes the Gateway's learned peer
+		// endpoint after Gateway restarts or peer replacement.
+		var probeIPs []string
+		seenProbeIPs := map[string]struct{}{}
+		for _, t := range config.Tunnels {
+			for _, gw := range t.GatewayIPs {
+				if gw.IP == "" {
+					continue
+				}
+				if _, ok := seenProbeIPs[gw.IP]; ok {
+					continue
+				}
+				seenProbeIPs[gw.IP] = struct{}{}
+				probeIPs = append(probeIPs, gw.IP)
+			}
+		}
+		setGatewayProbeIPs(probeIPs)
 
 		// Build gateway peers with allowedIPs from config
 		var gateways []wireguard.GatewayPeer
@@ -116,6 +157,13 @@ func main() {
 			} else {
 				slog.Info("Updated WireGuard gateways", "count", len(gateways))
 			}
+		}
+
+		if wgDevice != nil {
+			gatewayProbeOnce.Do(func() {
+				go runGatewayEndpointProbeLoop(ctx, wgDevice.Net(), getGatewayProbeIPs, gatewayProbeTrigger)
+			})
+			triggerGatewayProbe()
 		}
 
 		// Initialize local proxy if not yet started (only if WireGuard device was successfully created)
@@ -306,4 +354,49 @@ func loadOrCreateKeys(privateFromConfig string) (string, string, error) {
 		slog.Info("Generated new WireGuard key and saved", "path", filepath.Clean(keyFile))
 	}
 	return priv, pub, nil
+}
+
+func runGatewayEndpointProbeLoop(
+	ctx context.Context,
+	dialer wireguard.EndpointDialer,
+	getGatewayIPs func() []string,
+	trigger <-chan struct{},
+) {
+	const interval = 15 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	probe := func(reason string) {
+		ips := getGatewayIPs()
+		if len(ips) == 0 {
+			return
+		}
+		results := wireguard.ProbeGatewayEndpoints(
+			ctx,
+			dialer,
+			ips,
+			wireguard.DefaultGatewayProbePort,
+			wireguard.DefaultGatewayProbeTimeout,
+		)
+		failures := 0
+		for _, result := range results {
+			if result.Error != nil {
+				failures++
+				slog.Debug("Gateway endpoint probe failed", "addr", result.Address, "reason", reason, "error", result.Error)
+			}
+		}
+		slog.Debug("Gateway endpoint probe completed", "reason", reason, "targets", len(results), "failures", failures)
+	}
+
+	probe("startup")
+	for {
+		select {
+		case <-trigger:
+			probe("config_update")
+		case <-ticker.C:
+			probe("periodic")
+		case <-ctx.Done():
+			return
+		}
+	}
 }
