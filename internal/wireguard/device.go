@@ -96,7 +96,7 @@ func (d *Device) configureDevice() error {
 	}
 
 	// Build IPC configuration string with hex-encoded key
-	config := fmt.Sprintf("private_key=%x\n", privateKey[:])
+	config := fmt.Sprintf("private_key=%x\nreplace_peers=true\n", privateKey[:])
 
 	// Add peers (Gateways)
 	for _, gw := range d.config.Gateways {

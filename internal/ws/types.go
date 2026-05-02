@@ -34,7 +34,7 @@ type BaseMessage struct {
 type AuthMessage struct {
 	BaseMessage
 	APIKey     string `json:"apiKey"`
-	ClientType string `json:"clientType"` // "agent"
+	ClientType string `json:"clientType"`          // "agent"
 	PublicKey  string `json:"publicKey,omitempty"` // WireGuard public key generated locally
 	// Note: virtualIp is calculated by Control server from subnet, not sent by Agent
 }
@@ -94,6 +94,20 @@ type TunnelGatewayIP struct {
 	IP        string `json:"ip"`
 }
 
+// TunnelBackend represents one backend assigned to this Agent.
+type TunnelBackend struct {
+	ID          string `json:"id"`
+	TunnelID    string `json:"tunnelId"`
+	AgentID     string `json:"agentId"`
+	Target      string `json:"target"`
+	Enabled     bool   `json:"enabled"`
+	Draining    bool   `json:"draining"`
+	Weight      int    `json:"weight"`
+	Priority    int    `json:"priority"`
+	AgentIP     string `json:"agentIp"`
+	AgentStatus string `json:"agentStatus"`
+}
+
 // AgentConfig represents Agent configuration from Control
 type AgentConfig struct {
 	Agent struct {
@@ -114,8 +128,9 @@ type AgentConfig struct {
 		Domain            string            `json:"domain"`
 		Target            string            `json:"target"`
 		Enabled           bool              `json:"enabled"`
-		Subnet            string            `json:"subnet"`     // e.g., "10.1.0.0/24"
-		AgentIP           string            `json:"agentIp"`    // e.g., "10.1.0.2"
+		Subnet            string            `json:"subnet"`  // e.g., "10.1.0.0/24"
+		AgentIP           string            `json:"agentIp"` // e.g., "10.1.0.2"
+		Backends          []TunnelBackend   `json:"backends"`
 		GatewayIPs        []TunnelGatewayIP `json:"gatewayIps"` // All gateway IPs for this tunnel
 		HTTPProxyEnabled  bool              `json:"httpProxyEnabled"`
 		SOCKSProxyEnabled bool              `json:"socksProxyEnabled"`

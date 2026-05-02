@@ -62,6 +62,7 @@ func main() {
 	var exitHTTPProxy *exitnode.LocalHTTPProxy
 	var exitSOCKS5Proxy *exitnode.LocalSOCKS5Proxy
 	var gatewayProbeOnce sync.Once
+	var gatewayProbeCancel context.CancelFunc
 	gatewayProbeTrigger := make(chan struct{}, 1)
 	var gatewayProbeMu sync.RWMutex
 	var gatewayProbeIPs []string
@@ -91,10 +92,21 @@ func main() {
 			"tunnels_count", len(config.Tunnels),
 		)
 
-		// Extract virtual IPs from tunnels (one per tunnel)
+		// Extract virtual IPs from assigned backends.
 		var virtualIPs []string
+		seenVirtualIPs := map[string]struct{}{}
 		for _, t := range config.Tunnels {
-			if t.AgentIP != "" {
+			for _, backend := range t.Backends {
+				if backend.AgentIP == "" {
+					continue
+				}
+				if _, ok := seenVirtualIPs[backend.AgentIP]; ok {
+					continue
+				}
+				seenVirtualIPs[backend.AgentIP] = struct{}{}
+				virtualIPs = append(virtualIPs, backend.AgentIP)
+			}
+			if len(t.Backends) == 0 && t.AgentIP != "" {
 				virtualIPs = append(virtualIPs, t.AgentIP)
 			}
 		}
@@ -134,6 +146,30 @@ func main() {
 			gateways = append(gateways, peer)
 		}
 
+		virtualIPsChanged := wgDevice != nil && !sameStringSet(wgDevice.VirtualIPs(), virtualIPs)
+		if virtualIPsChanged {
+			slog.Info("Backend IP set changed, recreating WireGuard netstack", "virtual_ips", virtualIPs)
+			if exitHTTPProxy != nil {
+				exitHTTPProxy.Stop()
+				exitHTTPProxy = nil
+			}
+			if exitSOCKS5Proxy != nil {
+				exitSOCKS5Proxy.Stop()
+				exitSOCKS5Proxy = nil
+			}
+			if localProxy != nil {
+				localProxy.Shutdown()
+				localProxy = nil
+			}
+			if gatewayProbeCancel != nil {
+				gatewayProbeCancel()
+				gatewayProbeCancel = nil
+				gatewayProbeOnce = sync.Once{}
+			}
+			wgDevice.Close()
+			wgDevice = nil
+		}
+
 		// Initialize or update WireGuard device
 		if wgDevice == nil {
 			// First time initialization
@@ -161,7 +197,9 @@ func main() {
 
 		if wgDevice != nil {
 			gatewayProbeOnce.Do(func() {
-				go runGatewayEndpointProbeLoop(ctx, wgDevice.Net(), getGatewayProbeIPs, gatewayProbeTrigger)
+				var probeCtx context.Context
+				probeCtx, gatewayProbeCancel = context.WithCancel(ctx)
+				go runGatewayEndpointProbeLoop(probeCtx, wgDevice.Net(), getGatewayProbeIPs, gatewayProbeTrigger)
 			})
 			triggerGatewayProbe()
 		}
@@ -169,8 +207,7 @@ func main() {
 		// Initialize local proxy if not yet started (only if WireGuard device was successfully created)
 		// Note: The proxy listens on all virtual IPs via netstack
 		if localProxy == nil && wgDevice != nil && len(virtualIPs) > 0 {
-			// Use first virtual IP for the proxy address (netstack handles all IPs)
-			proxyAddr := virtualIPs[0] + ":80"
+			proxyAddr := "0.0.0.0:80"
 			localProxy = proxy.NewLocalProxy(wgDevice.Net(), proxyAddr)
 
 			// Start proxy in background
@@ -187,13 +224,27 @@ func main() {
 		if localProxy != nil {
 			var tunnels []proxy.TunnelMapping
 			for _, t := range config.Tunnels {
-				tunnel := proxy.TunnelMapping{
-					ID:      t.ID,
-					Domain:  t.Domain,
-					Target:  t.Target,
-					Enabled: t.Enabled,
+				if len(t.Backends) == 0 {
+					tunnel := proxy.TunnelMapping{
+						ID:      t.ID,
+						Domain:  t.Domain,
+						Target:  t.Target,
+						AgentIP: t.AgentIP,
+						Enabled: t.Enabled,
+					}
+					tunnels = append(tunnels, tunnel)
+					continue
 				}
-				tunnels = append(tunnels, tunnel)
+				for _, backend := range t.Backends {
+					tunnel := proxy.TunnelMapping{
+						ID:      backend.ID,
+						Domain:  t.Domain,
+						Target:  backend.Target,
+						AgentIP: backend.AgentIP,
+						Enabled: t.Enabled && backend.Enabled,
+					}
+					tunnels = append(tunnels, tunnel)
+				}
 			}
 			localProxy.UpdateTunnels(tunnels)
 		}
@@ -308,6 +359,9 @@ func main() {
 	if exitSOCKS5Proxy != nil {
 		exitSOCKS5Proxy.Stop()
 	}
+	if gatewayProbeCancel != nil {
+		gatewayProbeCancel()
+	}
 	if wgDevice != nil {
 		wgDevice.Close()
 	}
@@ -399,4 +453,21 @@ func runGatewayEndpointProbeLoop(
 			return
 		}
 	}
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	seen := make(map[string]int, len(left))
+	for _, value := range left {
+		seen[value]++
+	}
+	for _, value := range right {
+		if seen[value] == 0 {
+			return false
+		}
+		seen[value]--
+	}
+	return true
 }

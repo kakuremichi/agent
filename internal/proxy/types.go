@@ -11,6 +11,7 @@ type TunnelMapping struct {
 	ID      string
 	Domain  string
 	Target  string // e.g., "localhost:8080"
+	AgentIP string // Backend virtual IP for this target.
 	Enabled bool
 }
 
@@ -20,4 +21,5 @@ type LocalProxy struct {
 	tunnels map[string]*TunnelMapping // domain -> tunnel
 	addr    string                    // Listen address (e.g., "10.1.0.100:80")
 	net     *netstack.Net             // netstack network; nil => OS stack
+	stop    func()
 }

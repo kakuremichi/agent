@@ -81,3 +81,23 @@ func TestLocalProxy_DisabledTunnelsSkipped(t *testing.T) {
 		t.Error("enabled tunnel missing")
 	}
 }
+
+func TestLocalProxy_UpdateTunnels_KeysByBackendIP(t *testing.T) {
+	p := NewLocalProxy(nil, "127.0.0.1:0")
+
+	p.UpdateTunnels([]TunnelMapping{
+		{Domain: "same.test", AgentIP: "10.1.0.2", Target: "127.0.0.1:1", Enabled: true},
+		{Domain: "same.test", AgentIP: "10.1.0.3", Target: "127.0.0.1:2", Enabled: true},
+	})
+
+	tunnels := p.GetTunnels()
+	if got := len(tunnels); got != 2 {
+		t.Fatalf("expected 2 backend-specific mappings, got %d", got)
+	}
+	if tunnels["10.1.0.2|same.test"].Target != "127.0.0.1:1" {
+		t.Fatal("first backend mapping missing")
+	}
+	if tunnels["10.1.0.3|same.test"].Target != "127.0.0.1:2" {
+		t.Fatal("second backend mapping missing")
+	}
+}

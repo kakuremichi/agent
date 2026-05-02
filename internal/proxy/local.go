@@ -31,10 +31,14 @@ func (p *LocalProxy) UpdateTunnels(tunnels []TunnelMapping) {
 	for i := range tunnels {
 		tunnel := &tunnels[i]
 		if tunnel.Enabled {
-			newTunnels[tunnel.Domain] = tunnel
+			newTunnels[mappingKey(tunnel.Domain, tunnel.AgentIP)] = tunnel
+			if tunnel.AgentIP == "" {
+				newTunnels[tunnel.Domain] = tunnel
+			}
 			slog.Info("Added tunnel mapping",
 				"domain", tunnel.Domain,
 				"target", tunnel.Target,
+				"agent_ip", tunnel.AgentIP,
 			)
 		}
 	}
@@ -48,6 +52,7 @@ func (p *LocalProxy) UpdateTunnels(tunnels []TunnelMapping) {
 func (p *LocalProxy) Start(ctx context.Context) error {
 	slog.Info("Starting local proxy", "addr", p.addr, "netstack", p.net != nil)
 
+	childCtx, cancel := context.WithCancel(ctx)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", p.handleRequest)
 
@@ -74,7 +79,13 @@ func (p *LocalProxy) Start(ctx context.Context) error {
 
 		listener, err := p.net.ListenTCP(&net.TCPAddr{IP: ip, Port: port})
 		if err != nil {
+			cancel()
 			return fmt.Errorf("failed to listen on netstack %s: %w", p.addr, err)
+		}
+		p.stop = func() {
+			cancel()
+			listener.Close()
+			_ = server.Shutdown(context.Background())
 		}
 
 		go func() {
@@ -84,6 +95,10 @@ func (p *LocalProxy) Start(ctx context.Context) error {
 		}()
 	} else {
 		server.Addr = p.addr
+		p.stop = func() {
+			cancel()
+			_ = server.Shutdown(context.Background())
+		}
 		go func() {
 			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				slog.Error("Local proxy server error", "error", err)
@@ -92,7 +107,7 @@ func (p *LocalProxy) Start(ctx context.Context) error {
 	}
 
 	// Wait for context cancellation
-	<-ctx.Done()
+	<-childCtx.Done()
 	slog.Info("Shutting down local proxy")
 	return server.Shutdown(context.Background())
 }
@@ -102,9 +117,14 @@ func (p *LocalProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	host := r.Host
 	slog.Debug("Received request", "host", host, "path", r.URL.Path, "method", r.Method)
 
-	// Find tunnel for this domain
+	localIP := localAddressIP(r)
+
+	// Find tunnel for this domain and backend IP.
 	p.mu.RLock()
-	tunnel, exists := p.tunnels[host]
+	tunnel, exists := p.tunnels[mappingKey(host, localIP)]
+	if !exists {
+		tunnel, exists = p.tunnels[host]
+	}
 	p.mu.RUnlock()
 	if !exists {
 		slog.Warn("No tunnel found for domain", "domain", host)
@@ -156,6 +176,9 @@ func (p *LocalProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 // Shutdown gracefully shuts down the proxy
 func (p *LocalProxy) Shutdown() error {
+	if p.stop != nil {
+		p.stop()
+	}
 	slog.Info("Local proxy shutdown complete")
 	return nil
 }
@@ -169,6 +192,25 @@ func (p *LocalProxy) GetTunnels() map[string]*TunnelMapping {
 		result[k] = v
 	}
 	return result
+}
+
+func mappingKey(domain, agentIP string) string {
+	if agentIP == "" {
+		return domain
+	}
+	return agentIP + "|" + domain
+}
+
+func localAddressIP(r *http.Request) string {
+	addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if !ok || addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
 }
 
 // LocalProxyManager manages multiple local proxies (if needed for different interfaces)
